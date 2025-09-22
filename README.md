@@ -10,6 +10,7 @@
 
 - **Type Safety**: Implemented using Go 1.18+ generics with no type assertion or reflection overhead
 - **Resource Health Checking**: Automatically validates idle resources periodically
+- **Resource Expiration**: Supports age-based and idle-time-based resource expiration
 - **Concurrent Safety**: Supports concurrent operations across multiple goroutines
 - **Resource Limiting**: Prevents resource leaks and over-allocation
 - **Complete Statistics**: Provides detailed resource pool usage information
@@ -109,17 +110,23 @@ func main() {
 
 #### Factory[T any]
 
-Resource factory interface, defining resource lifecycle management:
+Resource factory interface, defining resource lifecycle management. Implementations must be thread-safe as methods may be called concurrently:
 
 ```go
 type Factory[T any] interface {
-    // Create creates a new resource
+    // Create creates a new resource. The context may be canceled if the pool
+    // is closed or the caller's context is canceled. Implementations should
+    // respect context cancellation and return promptly.
     Create(ctx context.Context) (T, error)
     
-    // Validate checks if a resource is valid/healthy
+    // Validate checks if a resource is still valid/healthy. This method should
+    // be fast as it may be called frequently. It should return false for any
+    // resource that should not be reused (e.g., closed connections, expired tokens).
     Validate(resource T) bool
     
-    // Close cleans up a resource
+    // Close cleans up a resource when it's removed from the pool. This method
+    // should not panic and should handle nil/invalid resources gracefully.
+    // Errors returned here are logged but don't affect pool operation.
     Close(resource T) error
 }
 ```
@@ -148,11 +155,20 @@ type Pool[T any] interface {
 
 ```go
 type Options struct {
-    // Maximum number of resources
+    // MaxSize is the maximum number of resources in the pool
     MaxSize int
     
-    // Health check interval for idle resources
+    // HealthCheckInterval specifies how often to run health checks on idle resources
+    // Set to 0 for default interval (5 minutes), negative values disable health checks
     HealthCheckInterval time.Duration
+    
+    // MaxResourceAge is the maximum time a resource can exist before being replaced
+    // Set to 0 to disable age-based expiration
+    MaxResourceAge time.Duration
+    
+    // MaxIdleTime is the maximum time a resource can be idle before being discarded
+    // Set to 0 to disable idle-based expiration
+    MaxIdleTime time.Duration
 }
 ```
 
@@ -195,6 +211,26 @@ func (f *MyResourceFactory) Validate(res *MyResource) bool {
 }
 ```
 
+### Resource Expiration Configuration
+
+Configure automatic resource expiration to maintain resource freshness:
+
+```go
+// Resources expire after 1 hour of existence
+options := genpool.Options{
+    MaxSize:        10,
+    MaxResourceAge: time.Hour,
+    MaxIdleTime:    30 * time.Minute, // Resources idle for 30min will be cleaned up
+}
+
+pool := genpool.New(factory, options)
+
+// Resources will be automatically cleaned up when:
+// 1. They exceed MaxResourceAge (1 hour since creation)
+// 2. They exceed MaxIdleTime (30 minutes since last use)
+// 3. They fail Factory.Validate() health checks
+```
+
 ### Handling Resource Creation Delays
 
 For resources that might take time to create, use context timeout:
@@ -229,9 +265,10 @@ func shutdown() {
 
 1. **Adjust Pool Size Appropriately**: Set reasonable pool size based on load and resource cost
 2. **Set Reasonable Health Check Intervals**: Too frequent adds CPU overhead, too rare might lead to using invalid resources
-3. **Always Handle `Release` Return Errors**: They may contain important resource cleanup issues
-4. **Define Precise Validation Logic**: Ensure the `Validate` method accurately detects resource health
-5. **Use Context to Manage Timeouts**: Prevent deadlocks and resource exhaustion under high load
+3. **Configure Resource Expiration**: Use `MaxResourceAge` and `MaxIdleTime` to maintain resource freshness
+4. **Always Handle `Release` Return Errors**: They may contain important resource cleanup issues
+5. **Define Precise Validation Logic**: Ensure the `Validate` method accurately detects resource health
+6. **Use Context to Manage Timeouts**: Prevent deadlocks and resource exhaustion under high load
 
 ## Thread Safety
 
@@ -245,13 +282,23 @@ func shutdown() {
 
 ## Error Handling
 
-GenPool may return the following predefined errors:
+GenPool provides comprehensive error handling for various failure scenarios:
 
-- `ErrPoolClosed`: Pool is closed
-- `ErrPoolFull`: Pool is at capacity limit
-- `ErrTimeout`: Operation timed out
+**Predefined Errors:**
+- `ErrPoolClosed`: Returned when operations are attempted on a closed pool
 
-Additionally, errors from the resource factory may be returned from `Get` and `Release` methods.
+**Factory Errors:**
+- Resource creation errors from `Factory.Create()` are propagated to callers via `Get()`
+- Resource cleanup errors from `Factory.Close()` are logged but don't affect pool operations
+
+**Context Handling:**
+- `Get()` respects the provided `context.Context` for cancellation and timeouts
+- Use `errors.Is(err, context.DeadlineExceeded)` to detect timeouts
+- Use `errors.Is(err, context.Canceled)` to detect cancellations
+
+**Automatic Resource Management:**
+- Invalid resources (when `Factory.Validate()` returns false) are automatically removed
+- Resources exceeding `MaxResourceAge` or `MaxIdleTime` are automatically cleaned up
 
 ## Contributing
 
@@ -275,6 +322,7 @@ MIT License
 
 - **类型安全**：使用 Go 1.18+ 的泛型实现，没有类型断言或反射开销
 - **资源健康检查**：自动定期验证空闲资源
+- **资源过期管理**：基于存活时间和空闲时间的自动资源清理
 - **并发安全**：支持多 goroutine 并发操作
 - **资源限制**：防止资源泄露和过度分配
 - **完整统计信息**：提供资源池使用详情
@@ -417,7 +465,16 @@ type Options struct {
     MaxSize int
     
     // 空闲资源的健康检查间隔
+    // 设为 0 使用默认间隔（5分钟），负值禁用健康检查
     HealthCheckInterval time.Duration
+    
+    // 资源最大存活时间 - 超过此时间的资源将被自动清理
+    // 设为 0 表示资源永不过期
+    MaxResourceAge time.Duration
+    
+    // 资源最大空闲时间 - 超过此时间未使用的资源将被清理
+    // 设为 0 表示资源不会因空闲而过期
+    MaxIdleTime time.Duration
 }
 ```
 
@@ -460,6 +517,26 @@ func (f *MyResourceFactory) Validate(res *MyResource) bool {
 }
 ```
 
+### 资源过期配置
+
+配置自动资源过期以保持资源新鲜度：
+
+```go
+// 资源在创建1小时后过期
+options := genpool.Options{
+    MaxSize:        10,
+    MaxResourceAge: time.Hour,
+    MaxIdleTime:    30 * time.Minute, // 空闲30分钟的资源将被清理
+}
+
+pool := genpool.New(factory, options)
+
+// 资源会在以下情况自动清理：
+// 1. 超过 MaxResourceAge（创建后1小时）
+// 2. 超过 MaxIdleTime（最后使用后30分钟）  
+// 3. Factory.Validate() 健康检查失败
+```
+
 ### 处理资源创建延迟
 
 对于创建可能耗时的资源，可以使用上下文超时：
@@ -494,9 +571,10 @@ func shutdown() {
 
 1. **适当调整池大小**：根据负载和资源成本设置合理的池大小
 2. **设置合理的健康检查间隔**：太频繁会增加CPU开销，太少可能导致使用失效资源
-3. **总是处理 `Release` 返回的错误**：它可能包含重要的资源清理问题
-4. **定义精确的验证逻辑**：确保 `Validate` 方法能准确检测资源的健康状态
-5. **使用上下文管理超时**：在高负载下防止死锁和资源耗尽
+3. **配置资源过期策略**：使用 `MaxResourceAge` 和 `MaxIdleTime` 保持资源新鲜度
+4. **总是处理 `Release` 返回的错误**：它可能包含重要的资源清理问题
+5. **定义精确的验证逻辑**：确保 `Validate` 方法能准确检测资源的健康状态
+6. **使用上下文管理超时**：在高负载下防止死锁和资源耗尽
 
 ## 线程安全性
 
@@ -510,13 +588,23 @@ GenPool 是完全线程安全的，可以在多个 goroutine 之间安全使用�
 
 ## 错误处理
 
-`GenPool` 可能返回以下预定义错误：
+GenPool 为各种故障场景提供全面的错误处理：
 
-- `ErrPoolClosed`: 池已关闭
-- `ErrPoolFull`: 池已达到容量上限
-- `ErrTimeout`: 操作超时
+**预定义错误：**
+- `ErrPoolClosed`: 在已关闭的池上执行操作时返回
 
-此外，从 `Get` 和 `Release` 方法可能返回源自资源工厂的错误。
+**工厂错误：**
+- `Factory.Create()` 的资源创建错误通过 `Get()` 传播给调用者
+- `Factory.Close()` 的资源清理错误会被记录但不影响池操作
+
+**上下文处理：**
+- `Get()` 遵循传入的 `context.Context` 进行取消和超时处理
+- 使用 `errors.Is(err, context.DeadlineExceeded)` 检测超时
+- 使用 `errors.Is(err, context.Canceled)` 检测取消
+
+**自动资源管理：**
+- 无效资源（`Factory.Validate()` 返回 false）自动移除
+- 超过 `MaxResourceAge` 或 `MaxIdleTime` 的资源自动清理
 
 ## 贡献
 

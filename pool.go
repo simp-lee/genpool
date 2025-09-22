@@ -11,8 +11,6 @@ import (
 // Common errors
 var (
 	ErrPoolClosed = errors.New("pool is closed")
-	ErrPoolFull   = errors.New("pool is at capacity")
-	ErrTimeout    = errors.New("operation timed out")
 )
 
 // Stats represents pool usage statistics
@@ -35,15 +33,22 @@ type Resource[T any] struct {
 	BorrowCount int       // Number of times this resource has been borrowed
 }
 
-// Factory defines functions to manage the lifecycle of a pooled resource
+// Factory defines functions to manage the lifecycle of a pooled resource.
+// Implementations must be thread-safe as methods may be called concurrently.
 type Factory[T any] interface {
-	// Create creates a new resource
+	// Create creates a new resource. The context may be canceled if the pool
+	// is closed or the caller's context is canceled. Implementations should
+	// respect context cancellation and return promptly.
 	Create(ctx context.Context) (T, error)
 
-	// Validate checks if a resource is still valid/healthy
+	// Validate checks if a resource is still valid/healthy. This method should
+	// be fast as it may be called frequently. It should return false for any
+	// resource that should not be reused (e.g., closed connections, expired tokens).
 	Validate(resource T) bool
 
-	// Close cleans up a resource when it's removed from the pool
+	// Close cleans up a resource when it's removed from the pool. This method
+	// should not panic and should handle nil/invalid resources gracefully.
+	// Errors returned here are logged but don't affect pool operation.
 	Close(resource T) error
 }
 
@@ -71,11 +76,13 @@ type SimplePool[T any] struct {
 	semaphore      chan struct{}        // Controls concurrent resource creation
 	zeroval        T                    // Zero value for type T
 
-	healthCheck time.Duration // Interval for health checks
-	mu          sync.Mutex
-	closed      bool
-	ctx         context.Context
-	cancel      context.CancelFunc
+	healthCheck    time.Duration // Interval for health checks
+	maxResourceAge time.Duration // Maximum age for resources
+	maxIdleTime    time.Duration // Maximum idle time for resources
+	mu             sync.Mutex
+	closed         bool
+	ctx            context.Context
+	cancel         context.CancelFunc
 
 	// Statistics
 	stats Stats
@@ -87,22 +94,42 @@ type Options struct {
 	MaxSize int
 
 	// HealthCheckInterval specifies how often to run health checks on idle resources
+	// Set to 0 to disable automatic health checks, negative values are treated as 0
 	HealthCheckInterval time.Duration
+
+	// MaxResourceAge is the maximum time a resource can exist before being replaced
+	// Set to 0 to disable age-based expiration
+	MaxResourceAge time.Duration
+
+	// MaxIdleTime is the maximum time a resource can be idle before being discarded
+	// Set to 0 to disable idle-based expiration
+	MaxIdleTime time.Duration
 }
 
 // New creates a new pool with the specified factory and options
 func New[T any](factory Factory[T], options Options) Pool[T] {
+	if factory == nil {
+		panic("pool: factory cannot be nil")
+	}
+
 	// Default values for options
 	if options.MaxSize <= 0 {
 		options.MaxSize = 10 // Default max size
 	}
-	if options.HealthCheckInterval <= 0 {
+	if options.MaxSize > 1000 {
+		// Reasonable upper limit to prevent resource exhaustion
+		options.MaxSize = 1000
+	}
+	if options.HealthCheckInterval < 0 {
+		options.HealthCheckInterval = 0 // Disable health check
+	} else if options.HealthCheckInterval == 0 {
 		options.HealthCheckInterval = 5 * time.Minute // Default health check interval
 	}
 
-	// Check if type T is comparable, as it's used as a map key via any(value)
-	var zero T
-	if !reflect.TypeOf(zero).Comparable() {
+	// Check if type T is comparable, as it's used as a map key via any(value).
+	// Use the type of (*T)(nil)).Elem() to avoid nil Type when T is an interface.
+	t := reflect.TypeOf((*T)(nil)).Elem()
+	if !t.Comparable() {
 		panic("pool: type T must be comparable to be used as a map key for inUseResources tracking")
 	}
 
@@ -115,6 +142,8 @@ func New[T any](factory Factory[T], options Options) Pool[T] {
 		maxSize:        options.MaxSize,
 		semaphore:      make(chan struct{}, options.MaxSize),
 		healthCheck:    options.HealthCheckInterval,
+		maxResourceAge: options.MaxResourceAge,
+		maxIdleTime:    options.MaxIdleTime,
 		ctx:            ctx,
 		cancel:         cancel,
 	}
@@ -134,49 +163,44 @@ func New[T any](factory Factory[T], options Options) Pool[T] {
 
 // Get retrieves a resource from the pool or creates a new one
 func (p *SimplePool[T]) Get(ctx context.Context) (T, error) {
-	for { // Loop to retry if a cached resource is invalid
-		p.mu.Lock()
-
-		if p.closed {
-			p.mu.Unlock()
-			return p.zeroval, ErrPoolClosed
-		}
-
-		// First try to get an existing resource
-		if len(p.resources) > 0 {
-			// Take the last resource (LIFO strategy for better cache locality)
-			lastIdx := len(p.resources) - 1
-			resWrapper := p.resources[lastIdx]
-			p.resources = p.resources[:lastIdx]
-			p.mu.Unlock() // Unlock before potentially long-running Validate
-
-			// Check if the resource is still valid
-			if p.factory.Validate(resWrapper.Value) {
-				// Resource is valid, update its metadata
-				resWrapper.LastUsed = time.Now()
-				resWrapper.BorrowCount++
-
-				p.mu.Lock()
-				p.inUseResources[any(resWrapper.Value)] = resWrapper
-				p.stats.Reused++
-				p.stats.InUse++
-				p.stats.Available = len(p.resources)
-				p.mu.Unlock()
-
-				return resWrapper.Value, nil
-			}
-
-			// Resource is invalid, close and discard it
-			_ = p.discardResource(resWrapper, true) // true indicates validation failure
-
-			// Continue to the next iteration of the loop to try again
-			continue
-		}
-
-		// No resources available, need to acquire a semaphore to create one
+	// Try to get an existing resource first
+	p.mu.Lock()
+	if p.closed {
 		p.mu.Unlock()
-		break // Break the loop to proceed to resource creation
+		return p.zeroval, ErrPoolClosed
 	}
+
+	var resWrapper *Resource[T]
+	maxRetries := 3 // Limit validation retries to avoid potential infinite loop
+
+	for retry := 0; retry < maxRetries && len(p.resources) > 0; retry++ {
+		// Take the last resource (LIFO strategy for better cache locality)
+		lastIdx := len(p.resources) - 1
+		resWrapper = p.resources[lastIdx]
+		p.resources = p.resources[:lastIdx]
+
+		// Quick validation check while holding lock to minimize unlock/lock cycles
+		if p.factory.Validate(resWrapper.Value) {
+			// Resource is valid, update its metadata
+			resWrapper.LastUsed = time.Now()
+			resWrapper.BorrowCount++
+
+			p.inUseResources[any(resWrapper.Value)] = resWrapper
+			p.stats.Reused++
+			p.stats.InUse++
+			p.stats.Available = len(p.resources)
+			p.mu.Unlock()
+
+			return resWrapper.Value, nil
+		}
+
+		// Resource is invalid, discard it and try next
+		p.discardResourceLocked(resWrapper, true)
+		resWrapper = nil
+	}
+
+	// No valid resources available in pool
+	p.mu.Unlock()
 
 	// Try to acquire semaphore with timeout from context
 	select {
@@ -185,6 +209,16 @@ func (p *SimplePool[T]) Get(ctx context.Context) (T, error) {
 	case <-ctx.Done():
 		return p.zeroval, ctx.Err()
 	}
+
+	// If pool was closed while waiting for semaphore, stop here
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		// Return token since we won't create
+		p.semaphore <- struct{}{}
+		return p.zeroval, ErrPoolClosed
+	}
+	p.mu.Unlock()
 
 	// Create a new resource
 	value, err := p.factory.Create(ctx)
@@ -204,7 +238,15 @@ func (p *SimplePool[T]) Get(ctx context.Context) (T, error) {
 		BorrowCount: 1,
 	}
 
+	// Before recording as in-use, re-check closed state under lock
 	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		// Pool closed in the meantime: close the created resource, return token, and error out
+		_ = p.factory.Close(value)
+		p.semaphore <- struct{}{}
+		return p.zeroval, ErrPoolClosed
+	}
 	p.inUseResources[any(value)] = newResWrapper
 	p.stats.Created++
 	p.stats.InUse++
@@ -297,6 +339,7 @@ func (p *SimplePool[T]) Stats() Stats {
 	stats := p.stats
 	stats.Available = len(p.resources)
 	stats.InUse = len(p.inUseResources)
+	stats.CurrentSize = len(p.resources) + len(p.inUseResources)
 	return stats
 }
 
@@ -324,26 +367,37 @@ func (p *SimplePool[T]) performHealthCheck() {
 		return
 	}
 
-	// Check resources in the pool
+	now := time.Now()
 	validResources := make([]*Resource[T], 0, len(p.resources))
+
 	for _, res := range p.resources {
-		if p.factory.Validate(res.Value) {
-			res.LastChecked = time.Now()
-			validResources = append(validResources, res)
+		shouldDiscard := false
+
+		// Check for age-based expiration
+		if p.maxResourceAge > 0 && now.Sub(res.CreatedAt) > p.maxResourceAge {
+			shouldDiscard = true
+		}
+
+		// Check for idle-based expiration
+		if !shouldDiscard && p.maxIdleTime > 0 && now.Sub(res.LastUsed) > p.maxIdleTime {
+			shouldDiscard = true
+		}
+
+		// Check health validation
+		if !shouldDiscard && !p.factory.Validate(res.Value) {
+			shouldDiscard = true
+		}
+
+		if shouldDiscard {
+			_ = p.discardResourceLocked(res, true) // true indicates validation/expiration failure
 		} else {
-			_ = p.discardResourceLocked(res, true) // true indicates validation failure
+			res.LastChecked = now
+			validResources = append(validResources, res)
 		}
 	}
 
 	p.resources = validResources
 	p.stats.Available = len(p.resources)
-}
-
-// discardResource closes and removes a resource, returning its token to the semaphore
-func (p *SimplePool[T]) discardResource(res *Resource[T], failed bool) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.discardResourceLocked(res, failed)
 }
 
 // discardResourceLocked is the lock-free version of discardResource

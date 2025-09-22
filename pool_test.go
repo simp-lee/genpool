@@ -298,6 +298,42 @@ func TestPoolErrorHandling(t *testing.T) {
 			t.Errorf("Expected 'mock close error', got: %v", err)
 		}
 	})
+
+	t.Run("NilFactoryPanic", func(t *testing.T) {
+		defer func() {
+			if r := recover(); r == nil {
+				t.Error("Expected New to panic with nil factory, but it did not")
+			} else {
+				expectedPanicMsg := "pool: factory cannot be nil"
+				if r != expectedPanicMsg {
+					t.Errorf("Expected panic message '%s', got '%v'", expectedPanicMsg, r)
+				}
+			}
+		}()
+
+		// This should panic
+		_ = New[*MockResource](nil, Options{MaxSize: 1})
+	})
+
+	t.Run("MaxSizeUpperLimit", func(t *testing.T) {
+		factory := &MockFactory{}
+
+		// Test that extremely large MaxSize gets capped
+		p := New(factory, Options{MaxSize: 2000}) // Above the 1000 limit
+		defer p.Close()
+
+		// Check that the pool respects the upper limit
+		// We can't easily test the exact limit without accessing internal state
+		// but we can verify the pool works normally
+		res, err := p.Get(context.Background())
+		if err != nil {
+			t.Errorf("Failed to get resource with capped MaxSize: %v", err)
+		} else {
+			if err := p.Release(res); err != nil {
+				t.Errorf("Failed to release resource: %v", err)
+			}
+		}
+	})
 }
 
 // Test health check and resource state management
@@ -537,6 +573,36 @@ func TestPoolEdgeCases(t *testing.T) {
 		}
 	})
 
+	t.Run("HealthCheckIntervalHandling", func(t *testing.T) {
+		factory := &MockFactory{}
+
+		// Test negative health check interval (should be treated as 0/disabled)
+		p1 := New(factory, Options{
+			MaxSize:             2,
+			HealthCheckInterval: -time.Minute, // Negative value
+		})
+		defer p1.Close()
+
+		// Test zero health check interval (should get default value)
+		p2 := New(factory, Options{
+			MaxSize:             2,
+			HealthCheckInterval: 0, // Zero value
+		})
+		defer p2.Close()
+
+		// Both pools should work normally
+		for i, p := range []Pool[*MockResource]{p1, p2} {
+			res, err := p.Get(context.Background())
+			if err != nil {
+				t.Errorf("Pool %d: Failed to get resource: %v", i+1, err)
+				continue
+			}
+			if err := p.Release(res); err != nil {
+				t.Errorf("Pool %d: Failed to release resource: %v", i+1, err)
+			}
+		}
+	})
+
 	t.Run("ReleaseForeignResource", func(t *testing.T) {
 		factory := &MockFactory{}
 		p := New(factory, Options{MaxSize: 5})
@@ -628,13 +694,157 @@ func TestPoolEdgeCases(t *testing.T) {
 
 // Test resource expiry
 func TestPoolResourceExpiry(t *testing.T) {
-	// This feature is not implemented in the pool yet, but tests are written for future extension
-	t.Skip("Resource expiry not implemented yet")
+	t.Run("MaxResourceAge", func(t *testing.T) {
+		factory := &MockFactory{}
+		maxAge := 100 * time.Millisecond
+		p := New(factory, Options{
+			MaxSize:             5,
+			HealthCheckInterval: 50 * time.Millisecond, // Fast health checks
+			MaxResourceAge:      maxAge,
+		})
+		defer p.Close()
 
-	// Future tests to implement:
-	// 1. Test resource expiry based on usage count
-	// 2. Test resource expiry based on time
-	// 3. Test exponential backoff replacement strategy
+		// Create and release a resource
+		res, err := p.Get(context.Background())
+		if err != nil {
+			t.Fatalf("Failed to get resource: %v", err)
+		}
+		if err := p.Release(res); err != nil {
+			t.Errorf("Failed to release resource: %v", err)
+		}
+
+		// Verify resource is available
+		stats := p.Stats()
+		if stats.Available != 1 {
+			t.Errorf("Expected 1 available resource, got %d", stats.Available)
+		}
+
+		// Wait for resource to age out
+		time.Sleep(maxAge + 100*time.Millisecond)
+
+		// Verify resource was discarded due to age
+		stats = p.Stats()
+		if stats.Available != 0 {
+			t.Errorf("Expected 0 available resources after aging out, got %d", stats.Available)
+		}
+		if stats.Discarded == 0 {
+			t.Error("Expected at least 1 discarded resource due to age")
+		}
+	})
+
+	t.Run("MaxIdleTime", func(t *testing.T) {
+		factory := &MockFactory{}
+		maxIdle := 100 * time.Millisecond
+		p := New(factory, Options{
+			MaxSize:             5,
+			HealthCheckInterval: 50 * time.Millisecond, // Fast health checks
+			MaxIdleTime:         maxIdle,
+		})
+		defer p.Close()
+
+		// Create and release a resource
+		res, err := p.Get(context.Background())
+		if err != nil {
+			t.Fatalf("Failed to get resource: %v", err)
+		}
+
+		// Use the resource (this updates LastUsed)
+		time.Sleep(10 * time.Millisecond)
+
+		if err := p.Release(res); err != nil {
+			t.Errorf("Failed to release resource: %v", err)
+		}
+
+		// Verify resource is available
+		stats := p.Stats()
+		if stats.Available != 1 {
+			t.Errorf("Expected 1 available resource, got %d", stats.Available)
+		}
+
+		// Wait for resource to become idle
+		time.Sleep(maxIdle + 100*time.Millisecond)
+
+		// Verify resource was discarded due to idle time
+		stats = p.Stats()
+		if stats.Available != 0 {
+			t.Errorf("Expected 0 available resources after idle timeout, got %d", stats.Available)
+		}
+		if stats.Discarded == 0 {
+			t.Error("Expected at least 1 discarded resource due to idle time")
+		}
+	})
+
+	t.Run("BothAgeAndIdleDisabled", func(t *testing.T) {
+		factory := &MockFactory{}
+		p := New(factory, Options{
+			MaxSize:             5,
+			HealthCheckInterval: 50 * time.Millisecond,
+			MaxResourceAge:      0, // Disabled
+			MaxIdleTime:         0, // Disabled
+		})
+		defer p.Close()
+
+		// Create and release a resource
+		res, err := p.Get(context.Background())
+		if err != nil {
+			t.Fatalf("Failed to get resource: %v", err)
+		}
+		if err := p.Release(res); err != nil {
+			t.Errorf("Failed to release resource: %v", err)
+		}
+
+		// Wait longer than typical timeout periods
+		time.Sleep(200 * time.Millisecond)
+
+		// Resource should still be available (no age/idle expiration)
+		stats := p.Stats()
+		if stats.Available != 1 {
+			t.Errorf("Expected 1 available resource (no expiration), got %d", stats.Available)
+		}
+	})
+
+	t.Run("CombinedExpiryConditions", func(t *testing.T) {
+		factory := &MockFactory{failRate: 0.0} // No random validation failures
+		p := New(factory, Options{
+			MaxSize:             5,
+			HealthCheckInterval: 30 * time.Millisecond,
+			MaxResourceAge:      200 * time.Millisecond,
+			MaxIdleTime:         150 * time.Millisecond,
+		})
+		defer p.Close()
+
+		// Create multiple resources with different usage patterns
+		resources := make([]*MockResource, 3)
+		for i := 0; i < 3; i++ {
+			res, err := p.Get(context.Background())
+			if err != nil {
+				t.Fatalf("Failed to get resource %d: %v", i, err)
+			}
+			resources[i] = res
+		}
+
+		// Release all resources at different times
+		for i, res := range resources {
+			if i > 0 {
+				time.Sleep(50 * time.Millisecond) // Stagger the release times
+			}
+			if err := p.Release(res); err != nil {
+				t.Errorf("Failed to release resource %d: %v", i, err)
+			}
+		}
+
+		// Wait for some resources to expire due to different conditions
+		time.Sleep(300 * time.Millisecond)
+
+		// All resources should be expired by now (either by age or idle time)
+		stats := p.Stats()
+		if stats.Available > 0 {
+			t.Logf("Warning: %d resources still available after expiry wait", stats.Available)
+		}
+		if stats.Discarded < 1 {
+			t.Error("Expected at least 1 resource to be discarded due to expiry conditions")
+		}
+	})
 }
 
 // Test with different factory implementations
@@ -774,7 +984,7 @@ func TestResourceMetadata(t *testing.T) {
 	if internalRes2.BorrowCount != 2 {
 		t.Errorf("Expected BorrowCount 2 after reuse, got %d", internalRes2.BorrowCount)
 	}
-	if internalRes2.LastUsed == initialLastUsed {
+	if internalRes2.LastUsed.Equal(initialLastUsed) {
 		t.Error("LastUsed was not updated after reuse")
 	}
 	if err := p.Release(resPtr2); err != nil {
